@@ -44,6 +44,13 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.linear_model import LinearRegression
+import seaborn as sns
+from fitter import Fitter, get_common_distributions, get_distributions
+from scipy.stats import gamma,lognorm,beta,expon,norm,iqr, scoreatpercentile
+from scipy.optimize import minimize_scalar
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.svm import OneClassSVM
+import random
 
 logger = BaseCfg.getLogger(__name__)
 
@@ -167,7 +174,7 @@ SUFFIXES = {
     '-l': 'String Label',
 }
 
-###### our changes
+##################################### our transformers
 
 # outliers replacer class
 class OutlierRemover(BaseEstimator,TransformerMixin): # our own class to remove outliers - we will insert it to the pipeline 
@@ -200,6 +207,189 @@ class OutlierRemover(BaseEstimator,TransformerMixin): # our own class to remove 
         return X # our transformed df
     
     
+class OutlierRemover_distrs(BaseEstimator,TransformerMixin): # does not work for now
+    def __init__(self):
+        self.fitters = {}
+    def cal_bounds(self,best_distr,data,params): # get the bunds for different distrs
+        if best_distr == "gamma":
+            shape, loc, scale = params["shape"],params["loc"],params["scale"]
+            theoretical_quantiles = gamma.ppf(np.linspace(0.01, 0.99, 99), shape, loc, scale)
+            observed_quantiles = np.percentile(data, np.linspace(1, 99, 99))
+            differences = np.abs(theoretical_quantiles - observed_quantiles)
+            iqr_differences = iqr(differences)
+            q1 = scoreatpercentile(data, 25)
+            q3 = scoreatpercentile(data, 75)
+            lower_bound = gamma.ppf(0.25 - 1.5*iqr_differences, shape, loc, scale)
+            upper_bound = gamma.ppf(0.75 + 1.5*iqr_differences, shape, loc, scale)
+            
+        elif best_distr == "lognorm":
+            s, loc, scale = params["s"],params["loc"],params["scale"]
+            theoretical_quantiles = lognorm.ppf(np.linspace(0.01, 0.99, 99), s, loc, scale)
+            observed_quantiles = np.percentile(data, np.linspace(1, 99, 99))
+            differences = np.abs(theoretical_quantiles - observed_quantiles)
+            iqr_differences = iqr(differences)
+            q1 = scoreatpercentile(data, 25)
+            q3 = scoreatpercentile(data, 75)
+            lower_bound = lognorm.ppf(0.25 - 1.5*iqr_differences, s, loc, scale)
+            upper_bound = lognorm.ppf(0.75 + 1.5*iqr_differences, s, loc, scale)
+            
+        elif best_distr == "beta":
+            a, b, loc, scale = params["a"],params["b"],params["loc"],params["scale"]
+            theoretical_quantiles = beta.ppf(np.linspace(0.01, 0.99, 99), a, b, loc, scale)
+            observed_quantiles = np.percentile(data, np.linspace(1, 99, 99))
+            differences = np.abs(theoretical_quantiles - observed_quantiles)
+            iqr_differences = iqr(differences)
+            q1 = scoreatpercentile(data, 25)
+            q3 = scoreatpercentile(data, 75)
+            lower_bound = beta.ppf(0.25 - 1.5*iqr_differences, a, b, loc, scale)
+            upper_bound = beta.ppf(0.75 + 1.5*iqr_differences, a, b, loc, scale)
+            
+        elif best_distr == "expon":
+            loc, scale = params["loc"], params["scale"]
+            theoretical_quantiles = expon.ppf(np.linspace(0.01, 0.99, 99), loc, scale)
+            observed_quantiles = np.percentile(data, np.linspace(1, 99, 99))
+            differences = np.abs(theoretical_quantiles - observed_quantiles)
+            iqr_differences = iqr(differences)
+            q1 = scoreatpercentile(data, 25)
+            q3 = scoreatpercentile(data, 75)
+            lower_bound = expon.ppf(0.25 - 1.5*iqr_differences, loc, scale)
+            upper_bound = expon.ppf(0.75 + 1.5*iqr_differences, loc, scale)
+            
+        else: # norm
+            loc, scale = params["shape"],params["loc"],params["scale"]
+            theoretical_quantiles = norm.ppf(np.linspace(0.01, 0.99, 99), loc, scale)
+            observed_quantiles = np.percentile(data, np.linspace(1, 99, 99))
+            differences = np.abs(theoretical_quantiles - observed_quantiles)
+            iqr_differences = iqr(differences)
+            q1 = scoreatpercentile(data, 25)
+            q3 = scoreatpercentile(data, 75)
+            lower_bound = norm.ppf(0.25 - 1.5*iqr_differences, loc, scale)
+            upper_bound = norm.ppf(0.75 + 1.5*iqr_differences, loc, scale)       
+        return lower_bound,upper_bound
+        
+    def fit(self,X,y=None):
+        for col in X.columns:
+            h = X[col].tolist()
+            f = Fitter(h, # try these 5
+           distributions=['gamma', # gamma
+                          'lognorm', # lognormal
+                          "beta", # beta
+                          "expon", # exp
+                          "norm"]) # gauss
+            f.fit()
+            self.fitters[col] = f         
+        return self
+    
+    @staticmethod
+    def neg_log_likelihood(lam, data): # max likelyhood method
+        n = len(data)
+        log_likelihood = n * np.log(lam) - lam * np.sum(data)
+        return -log_likelihood
+
+    def transform(self,X,y=None):
+        X = pd.DataFrame(X).copy()
+        for col in X.columns:
+            f = self.fitters[col]
+            data = X[col].tolist()
+            try:
+                d = f.get_best(method = 'sumsquare_error')
+                best_distr = list(d.keys())[0]
+                params = d[best_distr]
+                lower_bound,upper_bound = self.cal_bounds(best_distr,data,params) # get the upper and lower bound for each distr
+                x = X[col].copy() 
+                l = len(x[(x < lower_bound) | (x > upper_bound)])          
+                if best_distr == "gamma":
+                    alpha, beta = params["shape"],params["scale"]
+                    x[(x < lower_bound) | (x > upper_bound)] = [random.gammavariate(alpha, beta) for i in range(l)]
+                elif best_distr == "lognorm":
+                    mu, sigma = params["loc"],params["scale"]
+                    x[(x < lower_bound) | (x > upper_bound)] = [random.lognormvariate(mu, sigma) for i in range(l)]            
+                elif best_distr == "beta":
+                    alpha, beta = params["shape"],params["scale"]
+                    x[(x < lower_bound) | (x > upper_bound)] = [random.betavariate(alpha, beta) for i in range(l)]          
+                elif best_distr == "expon":
+                    res = minimize_scalar(self.neg_log_likelihood, args=(data,)) #OutlierRemover_distrs (use max likeluhhod method to estimate the lambda since mean could be 0 and lambda = 1/mean)
+                    lambda_exp = res.x
+                    x[(x < lower_bound) | (x > upper_bound)] = [random.expovariate(lambda_exp) for i in range(l)]            
+                elif best_distr == "norm": 
+                    mu, sigma = params["loc"],params["scale"]
+                    x[(x < lower_bound) | (x > upper_bound)] = [random.gauss(mu, sigma) for i in range(l)]   
+            except KeyError:
+                x[(x < lower_bound) | (x > upper_bound)] = x.median() # if all distr were dropped just use the median
+            X[col] = x 
+        return X
+    
+
+class Outliers_removal_ml(BaseEstimator,TransformerMixin): # working class
+    def __init__(self):
+        self.data = {}
+    
+    def fit(self,X,y=None):
+        print("!")
+        
+        for col in X.columns:  # for each col
+            print(col)
+            print()
+            d = X[[col]]
+            model = OneClassSVM(kernel='rbf', gamma='auto') # train binary SVM 
+            model.fit(d)
+            outliers = model.predict(d) == -1 # the outliers will be -1 else 1, so bool vector True is outlier else False
+            self.data[col] = outliers
+        print("!!")
+        return self
+    
+    @staticmethod
+    def neg_log_likelihood(lam, data): # max likelyhood method
+        n = len(data)
+        log_likelihood = n * np.log(lam) - lam * np.sum(data)
+        return -log_likelihood
+    
+    
+    
+    def transform(self,X,y=None):
+        print("!!!")
+        X = pd.DataFrame(X).copy()
+        for col in X.columns:
+            print(col)
+            outlier_inds = self.data[col]           
+            x = X[col].copy()
+            h = X[col].tolist() # data for column
+            f = Fitter(h, # try these 5 distrs
+           distributions=['gamma', # gamma
+                          'lognorm', # lognormal
+                          "beta", # beta
+                          "expon", # exp
+                          "norm"]) # gauss
+            f.fit()
+            #f.summary() see the graph and results
+            try:
+                d = f.get_best(method = 'sumsquare_error') # get the best one
+                best_distr = list(d.keys())[0] # get its params
+                params = d[best_distr] 
+                l = sum(outlier_inds)       # whole num of outliers   
+                if best_distr == "gamma": # for differetn distrs
+                    alpha, beta = params["shape"],params["scale"] # get neccassary params
+                    x[outlier_inds] =  list(random.gammavariate(alpha, beta) for i in range(l)) # generate nums (note that they are in the form generators and then we convrete them to list - saves a bit more time)
+                elif best_distr == "lognorm":
+                    mu, sigma = params["loc"],params["scale"]
+                    x[outlier_inds] = list(random.lognormvariate(mu, sigma) for i in range(l))        
+                elif best_distr == "beta":
+                    alpha, beta = params["shape"],params["scale"]
+                    x[outlier_inds] = list(random.betavariate(alpha, beta) for i in range(l))      
+                elif best_distr == "expon": # here sit is a bit different since lambda can be 1/0 since mean could be 0 and lambda = 1/mean
+                    res = minimize_scalar(self.neg_log_likelihood, args=(h,)) #OutlierRemover_distrs (use max likeluhhod method to estimate the lambda since mean could be 0 and lambda = 1/mean)
+                    lambda_exp = res.x
+                    x[outlier_inds] = list(random.expovariate(lambda_exp) for i in range(l))    
+                elif best_distr == "norm": 
+                    mu, sigma = params["loc"],params["scale"]
+                    x[outlier_inds] = list(random.gauss(mu, sigma) for i in range(l)) 
+            except KeyError: # in case non of the distr were fitted for some reason
+                x[outlier_inds]= x.median() # just use the median
+            X[col] = x
+        print("!!!!")
+        return X.reset_index(drop=True)
+            
+             
 class Custom_Cat_Imputer(BaseEstimator, TransformerMixin):
     def fit(self, X, y=None):
         return self
@@ -268,11 +458,14 @@ class custom_imputer(BaseEstimator, TransformerMixin): # based on the linear cor
             X[column].fillna(med, inplace=True) # replace with the mdeian
         return X     
         
-class custom_numeric_imputer(BaseEstimator, TransformerMixin):
-    def __init__(self):
+class custom_numeric_imputer(BaseEstimator, TransformerMixin): # ml approach
+    def __init__(self,dec = False):
         self.models = [] 
         self.tests = {}
+        self.dec = dec
+        
     def fit(self,X,y=None):
+        print("?")
         features = set(X.columns.tolist()) 
         m = X.isna()
         select = []
@@ -293,14 +486,16 @@ class custom_numeric_imputer(BaseEstimator, TransformerMixin):
             """
             X_train = X[list(features)].iloc[train, :] 
             y_train = X[[col]].iloc[train, :]
-            model = LinearRegression() # regression
+            model = LinearRegression() if not self.dec else RandomForestRegressor() #LinearRegression() # regression or dec tree
             model.fit(X_train,y_train) # train
             self.tests[col] = [model,test] # model, and test indicies
         else:
             self.features = list(features) # remembrt the list of features
+        print("??")
         return self
             
     def transform(self,X,y=None):
+        print("???")
         X = pd.DataFrame(X).copy().reset_index(drop=True)
         for col in X.columns: # for each column
             data = self.tests.get(col,False)
@@ -312,12 +507,16 @@ class custom_numeric_imputer(BaseEstimator, TransformerMixin):
             Select the null rows in the target to predict
             """
             preds = model.predict(X[self.features].iloc[test_inds, :])
-            for cube in preds: # convert the result to one dim array
-                no_nulls.append(cube[0])
+            if not self.dec:
+                for cube in preds: # convert the result to one dim array
+                    no_nulls.append(cube[0])
+            else:
+                no_nulls = preds
                 
             x = X.loc[:, col].copy()  # get the copy
             x[test_inds] = no_nulls # replace the null indicies with the predicted not nulls
             X.loc[:, col] = x # make the change
+        print("????")
         return X    
     
 
@@ -344,7 +543,7 @@ class Dates_numeric_Pipeline(BaseEstimator,TransformerMixin):
             X[col] = X[col].interpolate(method='linear').round(0)
             X[col] = X[col].interpolate(method='bfill', limit_direction = "backward")
         return X 
-    
+####################################################    
     
 
 class Preprocessor(TransformerMixin, BaseEstimator):
@@ -711,10 +910,9 @@ class Preprocessor(TransformerMixin, BaseEstimator):
                 logger.debug(Xdf.head())
                 self.Xdf = Xdf  # for debug
             self.fited_all_ = True
- 
         ###### Prepocessing part (some of it)
-        
-        threshold = 0.5
+        print("Started")
+        threshold = 0.6
         
         na_percentages = Xdf.isna().sum() / Xdf.shape[0]
         cols_to_drop = list(na_percentages[na_percentages > threshold].index)
@@ -766,7 +964,7 @@ class Preprocessor(TransformerMixin, BaseEstimator):
         
         numeric = Pipeline([ 
         ('imputer', custom_numeric_imputer()), # regression class
-        ("outliers_removal", OutlierRemover())])  # outliers and no scaling here
+        ("outliers_removal", Outliers_removal_ml())])  # outliers and no scaling here _distrs
         
         dates_pipe_spec = Pipeline([('numeric_dates', Dates_numeric_Pipeline())]) # interpolate na
         dates_pipe_common = Pipeline([('rest_dates', Dates_common_Pipeline())]) # bfil and ffil for na
@@ -778,7 +976,7 @@ class Preprocessor(TransformerMixin, BaseEstimator):
 
         g = full_pipeline.fit_transform(Xdf)
         
-        columns = num_cols + dates_special+ common_dates +list(one_hot_names) + others # match the order
+        columns = num_cols + dates_special+ common_dates + list(one_hot_names) + others # match the order
         
         
         z = pd.DataFrame(g,columns=columns)
@@ -787,18 +985,14 @@ class Preprocessor(TransformerMixin, BaseEstimator):
         
         dates_to_change = dates_special
         
-        #for c in dates_special:
-            #if Xdf[dates_special].dtypes[c] != "datetime64[ns]":
-                #dates_to_change.append(c)
                 
         all_cols = num_cols+dates_to_change+list(one_hot_names)
         z[all_cols] = z[all_cols].apply(pd.to_numeric) #convert all numeric from onbject to float again
         z = z.reindex(sorted(z.columns), axis=1)
         Xdf = z
-        Xdf.head(n=100).to_excel("preporcesed_data.xlsx")
-        self.encoded_hot = num_cols+list(one_hot_names) # add the rest of the cols
+        Xdf.head(n=30).to_excel("preporcesed_data.xlsx")
+        self.flag_to_include_else = False #num_cols+list(one_hot_names) # add the rest of the cols
         self.Xdf = Xdf
-        #print(Xdf.info())
         return Xdf
     
     
